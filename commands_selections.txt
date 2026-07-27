@@ -5,3 +5,9 @@ pk.e792503785b6b6cebd3c6c52b40b8d45
 python test_api.py
 
 python test_full_system.py   
+
+python -m streamlit run test_step1.py
+
+python -m streamlit run test_step2.py
+
+python -m streamlit run test_step3.py
