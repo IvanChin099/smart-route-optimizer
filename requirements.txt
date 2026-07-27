@@ -1,0 +1,6 @@
+streamlit
+ortools
+geopy
+requests
+folium
+streamlit-folium
