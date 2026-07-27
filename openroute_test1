@@ -1,0 +1,109 @@
+import os
+from geopy.geocoders import Nominatim
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+import requests
+
+# 配送地点 (支持直接填文本地址)
+LOCATIONS = [
+    "Kuching Waterfront, Sarawak, Malaysia",  # 起点 (餐厅/仓库)
+    "Vivacity Megamall, Kuching, Sarawak",  # 顾客 A
+    "Swinburne University Kuching, Sarawak",  # 顾客 B
+    "The Spring Shopping Mall, Kuching",  # 顾客 C
+]
+
+SERVICE_TIMES_SEC = [0, 300, 300, 300]  # 每个送货点的卸货耗时 (秒)
+
+
+def geocode_address(address):
+    """将文本地址转换为 GPS 经纬度"""
+    geolocator = Nominatim(user_agent="my_delivery_route_app")
+    location = geolocator.geocode(address)
+    if location:
+        # OSRM 要求的格式为: [经度, 纬度]
+        return [location.longitude, location.latitude]
+    else:
+        raise ValueError(f"无法定位地址: {address}")
+
+
+def get_time_matrix_osrm(locations):
+    """使用公用 OSRM 引擎获取时间矩阵（无需 API Key）"""
+    print("📍 正在将文本地址转换为 GPS 坐标...")
+    coords = [geocode_address(loc) for loc in locations]
+
+    # 将所有坐标拼成 OSRM 要求的格式: lng1,lat1;lng2,lat2;lng3,lat3
+    coord_str = ";".join([f"{c[0]},{c[1]}" for c in coords])
+
+    # OSRM 公用 Table API Endpoint
+    url = f"http://router.project-osrm.org/table/v1/driving/{coord_str}?annotations=duration"
+
+    headers = {"User-Agent": "MyDeliveryOptimizer/1.0"}
+
+    print("🌐 正在从 OSRM 请求免费行驶时间矩阵...")
+    response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        raise Exception(f"OSRM 请求失败，状态码: {response.status_code}")
+
+    data = response.json()
+
+    # OSRM 返回的 durations 是以“秒”为单位的二维数组
+    time_matrix = [[int(cell) for cell in row] for row in data["durations"]]
+    return time_matrix
+
+
+def solve_vrp():
+    # 1. 获取免费行驶时间矩阵
+    time_matrix_sec = get_time_matrix_osrm(LOCATIONS)
+
+    # 2. 初始化 OR-Tools
+    manager = pywrapcp.RoutingIndexManager(len(LOCATIONS), 1, 0)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def time_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return time_matrix_sec[from_node][to_node] + SERVICE_TIMES_SEC[to_node]
+
+    transit_callback_index = routing.RegisterTransitCallback(time_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+
+    # 3. 求解
+    solution = routing.SolveWithParameters(search_parameters)
+
+    # 4. 输出结果
+    if solution:
+        print("\n" + "=" * 50)
+        print(" 🚀 基于 OSRM 开源地图的最佳送货路线")
+        print("=" * 50)
+
+        index = routing.Start(0)
+        total_time_sec = 0
+
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            print(f" 📍 [{node}] {LOCATIONS[node]}")
+
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+
+            from_node = manager.IndexToNode(previous_index)
+            to_node = manager.IndexToNode(index)
+            total_time_sec += (
+                time_matrix_sec[from_node][to_node] + SERVICE_TIMES_SEC[to_node]
+            )
+
+        end_node = manager.IndexToNode(index)
+        print(f" 📍 [{end_node}] {LOCATIONS[end_node]}")
+
+        print("-" * 50)
+        print(f"⏱️ 全程预估总耗时: {round(total_time_sec / 60, 1)} 分钟")
+        print("=" * 50)
+
+
+if __name__ == "__main__":
+    solve_vrp()
