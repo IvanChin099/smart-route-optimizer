@@ -1,52 +1,102 @@
+import math
+import time
+import urllib.parse
 import folium
-from geopy.geocoders import Nominatim
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
-import urllib.parse
 
 # ---------------------------------------------------------------------------
-# 1. 页面基本配置
+# 1. 页面基本配置与高级自定义 CSS 样式
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="智能送货路线优化系统 V2.0", page_icon="🚚", layout="wide"
+    page_title="Smart Route AI - 智能送货调度系统",
+    page_icon="🚚",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🚚 智能送货路径优化系统 V2.0")
-st.caption(
-    "支持【多司机分流排单】与【手机一键 Waze / Google Maps 导航】的算法控制台"
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #f8f9fa; }
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 800;
+        background: -webkit-linear-gradient(45deg, #FF4B4B, #FF8F00);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 5px;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1f2937;
+    }
+    </style>
+""",
+    unsafe_allow_html=True,
 )
 
 if "calculated" not in st.session_state:
     st.session_state.calculated = False
 
+LOCATIONIQ_TOKEN = "pk.e792503785b6b6cebd3c6c52b40b8d45"
 
 # ---------------------------------------------------------------------------
-# 2. 核心算法与导航链接生成函数
+# 2. 核心算法与地理解析函数
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def geocode_address(address):
-    """将文本地址转换为 GPS 经纬度"""
-    geolocator = Nominatim(user_agent="my_delivery_route_app_v4")
-    location = geolocator.geocode(address)
-    if location:
-        return [location.longitude, location.latitude], location.address
-    return None, None
+def geocode_address_locationiq_debug(address):
+    url = f"https://us1.locationiq.com/v1/search?key={LOCATIONIQ_TOKEN.strip()}&q={urllib.parse.quote(address)}&format=json&countrycodes=my"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    try:
+        res = requests.get(url, headers=headers, timeout=6)
+        status_code = res.status_code
+        if status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                lng = float(data[0]["lon"])
+                lat = float(data[0]["lat"])
+                display_name = data[0].get("display_name", address)
+                return [lng, lat], display_name, {"status": 200, "msg": "Success", "raw": data[0]}
+            else:
+                return None, None, {"status": 200, "msg": "返回列表为空", "raw": res.text}
+        else:
+            return None, None, {"status": status_code, "msg": f"HTTP Error {status_code}", "raw": res.text}
+    except Exception as e:
+        return None, None, {"status": 0, "msg": "请求异常", "raw": str(e)}
 
 
 def get_time_matrix(coords):
-    """调用 OSRM 获取时间矩阵"""
-    coord_str = ";".join([f"{c[0]},{c[1]}" for c in coords])
-    table_url = f"http://router.project-osrm.org/table/v1/driving/{coord_str}?annotations=duration"
-    res = requests.get(
-        table_url, headers={"User-Agent": "MyDeliveryOptimizer/2.0"}
-    )
-    return [[int(cell) for cell in row] for row in res.json()["durations"]]
+    """离线多维距离矩阵"""
+    num_locs = len(coords)
+    matrix = [[0] * num_locs for _ in range(num_locs)]
+    AVERAGE_SPEED_MPS = 9.72  # ~35 km/h
+    ROAD_DETOUR_FACTOR = 1.3
+
+    for i in range(num_locs):
+        for j in range(num_locs):
+            if i == j:
+                matrix[i][j] = 0
+            else:
+                lng1, lat1 = coords[i]
+                lng2, lat2 = coords[j]
+                rad_lat1, rad_lat2 = math.radians(lat1), math.radians(lat2)
+                d_lat = math.radians(lat2 - lat1)
+                d_lng = math.radians(lng2 - lng1)
+
+                a = math.sin(d_lat / 2) ** 2 + math.cos(rad_lat1) * math.cos(rad_lat2) * math.sin(d_lng / 2) ** 2
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                distance_meters = 6371000 * c
+                matrix[i][j] = int((distance_meters * ROAD_DETOUR_FACTOR) / AVERAGE_SPEED_MPS)
+    return matrix
 
 
 def solve_vrp_multi_vehicle(time_matrix, service_times, num_vehicles):
-    """使用 OR-Tools 求解多司机（Multi-Vehicle）最短时间路线"""
     num_locs = len(time_matrix)
     manager = pywrapcp.RoutingIndexManager(num_locs, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
@@ -59,19 +109,23 @@ def solve_vrp_multi_vehicle(time_matrix, service_times, num_vehicles):
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # 增加维度，限制单车总时间（尽量平衡各个司机的负荷）
+    time_dimension_name = "Time"
+    # ⚡ 设定：单人最大工时为 6 小时 (21600 秒)
     routing.AddDimension(
         transit_callback_index,
-        3600,  # 允许等待超时阈值
-        14400,  # 每一个司机的最大工作时长 (4小时)
-        True,  # 强制从零开始计时间
-        "Time",
+        3600,
+        21600,
+        True,
+        time_dimension_name,
     )
+    time_dimension = routing.GetDimensionOrDie(time_dimension_name)
+    time_dimension.SetGlobalSpanCostCoefficient(40)  # 均衡因子
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     )
+    search_parameters.time_limit.seconds = 5
 
     solution = routing.SolveWithParameters(search_parameters)
 
@@ -80,19 +134,21 @@ def solve_vrp_multi_vehicle(time_matrix, service_times, num_vehicles):
         for vehicle_id in range(num_vehicles):
             index = routing.Start(vehicle_id)
             route = []
+            # ⚡ 包含 Start 和 End，确保完整计算返程 (Round Trip)
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 route.append(node)
                 index = solution.Value(routing.NextVar(index))
+            # 强制加上终点 0 (发货仓库)，实现返程闭环
             route.append(manager.IndexToNode(index))
-            # 只有当司机有任务时（不只停留在起点）才计入
+
+            # 只要中间有配送点（长度大于2，即：仓库 -> 站点... -> 仓库）
             if len(route) > 2:
                 routes[vehicle_id] = route
     return routes
 
 
 def build_nav_urls(dest_name, lat, lng):
-    """生成一键唤起 Google Maps 和 Waze 的 Universal Links"""
     encoded_name = urllib.parse.quote(dest_name)
     gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}&destination_place_id={encoded_name}"
     waze_url = f"https://waze.com/ul?ll={lat},{lng}&navigate=yes"
@@ -100,70 +156,139 @@ def build_nav_urls(dest_name, lat, lng):
 
 
 # ---------------------------------------------------------------------------
-# 3. Streamlit 网页 UI
+# 3. 页面侧边栏（Sidebar）
 # ---------------------------------------------------------------------------
-col_left, col_right = st.columns([1, 2])
-
-with col_left:
-    st.subheader("📋 运力与送货清单")
+with st.sidebar:
+    st.markdown("## 🚚 调度控制中心")
+    st.caption("商业级多司机排单算法平台")
+    st.divider()
 
     depot_input = st.text_input(
-        "📍 发货起点 (餐厅/仓库):",
+        "🏭 发货起点 (仓库/餐厅):",
         "Kuching Waterfront, Sarawak, Malaysia",
     )
 
     stops_input = st.text_area(
-        "📍 送货目的地列表 (每行一个地址):",
+        "📍 配送目的地 (每行一个):",
         "Vivacity Megamall, Kuching, Sarawak\nSwinburne University Kuching, Sarawak\nThe Spring Shopping Mall, Kuching\nPlaza Merdeka, Kuching, Sarawak\nAEON Mall Kuching Central, Sarawak",
-        height=150,
+        height=180,
     )
 
+    st.subheader("🚚 运力参数设置")
     col_v, col_s = st.columns(2)
     with col_v:
+        # ⚡ 司机上限调整为最多 6 人
         num_drivers = st.number_input(
-            "🚚 出动司机人数:", min_value=1, max_value=5, value=2
+            "司机人数", min_value=1, max_value=6, value=3
         )
     with col_s:
         service_time_min = st.number_input(
-            "⏱️ 卸货耗时 (分钟):", min_value=1, max_value=30, value=5
+            "卸货耗时(分)", min_value=1, max_value=30, value=5
         )
 
+    st.divider()
     btn_submit = st.button(
-        "🚀 开始多车辆智能派单", type="primary", use_container_width=True
+        "⚡ 一键生成最佳调度方案", type="primary", use_container_width=True
     )
+
+    # 💡 明确标出系统的 3 个约束条件
+    with st.expander("ℹ️ 系统规则与参数上限说明"):
+        st.markdown(
+            """
+            * 📍 **最多送货点**：上限 **30 个地点**（超出系统将提示拦截）。
+            * 👥 **最多司机数**：支持 **1 ~ 6 位司机** 并行调度。
+            * ⏱️ **单人最长工时**：每位司机上限 **6 小时**（含返程时间）。
+            * 🔄 **闭环返程计算**：总耗时已**强制包含司机返回仓库的时间与路程**。
+            """
+        )
+
+# ---------------------------------------------------------------------------
+# 4. 页面主区域（Main Canvas）
+# ---------------------------------------------------------------------------
+st.markdown(
+    '<div class="main-header">🚚 Smart Route AI 智能调度系统</div>',
+    unsafe_allow_html=True,
+)
+st.caption("商业级 API 驱动 | 支持返程闭环与负载均衡")
+st.divider()
 
 if btn_submit:
     stops_list = [
         line.strip() for line in stops_input.split("\n") if line.strip()
     ]
-    all_locations = [depot_input] + stops_list
+    
+    # ⚡ 条件拦截 1：超过 30 个地点直接拦截并提示
+    if len(stops_list) > 30:
+        st.error(f"⚠️ 当前输入了 {len(stops_list)} 个送货地点，超过了系统允许上限（最多 30 个）！请减少地点后重新计算。")
+    else:
+        all_locations = [depot_input] + stops_list
+        total_count = len(all_locations)
 
-    with st.spinner("正在请求路况与多路线优化算法..."):
         coords = []
         valid_locations = []
-        for loc in all_locations:
-            c, full_addr = geocode_address(loc)
+        failed_locations = []
+        debug_logs = []
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for idx, loc in enumerate(all_locations):
+            status_text.text(f"⚡ 解析中 {idx+1}/{total_count}: {loc}")
+            progress_bar.progress((idx + 1) / total_count)
+
+            c, full_addr, log_info = geocode_address_locationiq_debug(loc)
+            debug_logs.append({"address": loc, "log": log_info})
+
             if c:
                 coords.append(c)
                 valid_locations.append(loc)
+            else:
+                failed_locations.append(loc)
+
+            time.sleep(0.4)
+
+        status_text.empty()
+        progress_bar.empty()
+
+        with st.expander("🐞 Streamlit 网页 API 诊断面板 (点击查看底层请求详情)"):
+            st.write(f"**使用的 Key 前缀**: `{LOCATIONIQ_TOKEN[:10]}...`")
+            for log_item in debug_logs:
+                addr = log_item["address"]
+                info = log_item["log"]
+                if info["status"] == 200 and "Success" in info["msg"]:
+                    st.success(f"🟢 **{addr}** -> Status: 200 OK")
+                else:
+                    st.error(
+                        f"🔴 **{addr}** -> Status: {info['status']} | 消息: {info['msg']} | 原始返回: `{info['raw']}`"
+                    )
+
+        if failed_locations:
+            st.warning(
+                f"⚠️ 有 {len(failed_locations)} 个地址无法定位，已自动跳过：{', '.join(failed_locations)}"
+            )
 
         if len(coords) >= 2:
-            service_times_sec = [0] + [service_time_min * 60] * (
-                len(coords) - 1
-            )
-            time_matrix = get_time_matrix(coords)
-            routes = solve_vrp_multi_vehicle(
-                time_matrix, service_times_sec, num_drivers
-            )
+            with st.spinner("🚀 地理坐标已就位！OR-Tools 运筹算法正在求解最佳路线 (含返程闭环)..."):
+                # 起点仓库的 service_time 为 0，其余配送点为输入值
+                service_times_sec = [0] + [service_time_min * 60] * (
+                    len(coords) - 1
+                )
+                time_matrix = get_time_matrix(coords)
+                routes = solve_vrp_multi_vehicle(
+                    time_matrix, service_times_sec, num_drivers
+                )
 
-            st.session_state.calculated = True
-            st.session_state.valid_locations = valid_locations
-            st.session_state.coords = coords
-            st.session_state.routes = routes
-            st.session_state.time_matrix = time_matrix
-            st.session_state.service_times_sec = service_times_sec
+                if routes:
+                    st.session_state.calculated = True
+                    st.session_state.valid_locations = valid_locations
+                    st.session_state.coords = coords
+                    st.session_state.routes = routes
+                    st.session_state.time_matrix = time_matrix
+                    st.session_state.service_times_sec = service_times_sec
+                else:
+                    st.error("❌ 运筹算法未能求解出方案！原因可能为：单人 6 小时工时限制不足以跑完所选地点，请尝试增加司机人数。")
 
-# 渲染计算结果
+# 渲染数据看板
 if st.session_state.calculated:
     valid_locations = st.session_state.valid_locations
     coords = st.session_state.coords
@@ -171,78 +296,111 @@ if st.session_state.calculated:
     time_matrix = st.session_state.time_matrix
     service_times_sec = st.session_state.service_times_sec
 
-    with col_right:
-        st.subheader("🗺️ 司机分流派单路线图")
+    total_stops = len(valid_locations) - 1
+    active_drivers = len(routes)
 
-        # 初始化地图
+    driver_times = []
+    for vehicle_id, route in routes.items():
+        # 计算包含起点到终点、再从终点回到起点的完整闭环时间
+        v_sec = sum(
+            time_matrix[route[i]][route[i + 1]] + service_times_sec[route[i + 1]]
+            for i in range(len(route) - 1)
+        )
+        driver_times.append(v_sec)
+
+    max_time_min = round(max(driver_times) / 60, 1) if driver_times else 0
+    total_time_min = round(sum(driver_times) / 60, 1) if driver_times else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("📦 待送货点", f"{total_stops} 个点")
+    m2.metric("🚚 出动司机", f"{active_drivers} 位")
+    m3.metric("⏱️ 方案最长耗时 (含返程)", f"{max_time_min} 分钟")
+    m4.metric("📊 累积总耗时 (含返程)", f"{total_time_min} 分钟")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col_map, col_list = st.columns([1.2, 1])
+    colors = ["blue", "green", "purple", "orange", "darkred", "cadetblue"]
+
+    with col_map:
+        st.subheader("🗺️ 全局实景路线看板 (闭环路径)")
         center_lat, center_lng = coords[0][1], coords[0][0]
         m = folium.Map(location=[center_lat, center_lng], zoom_start=12)
 
-        # 定义多位司机的路线专属颜色
-        colors = ["blue", "green", "purple", "orange", "darkred"]
-
-        # 标记发货仓库
         folium.Marker(
             [coords[0][1], coords[0][0]],
-            popup="总仓库 / 发货点",
-            tooltip="📍 起点/仓库",
+            popup="起点仓库 (发货/返程中心)",
+            tooltip="🏭 发货仓库",
             icon=folium.Icon(color="red", icon="home"),
         ).add_to(m)
 
         for driver_idx, (vehicle_id, route) in enumerate(routes.items()):
             color = colors[driver_idx % len(colors)]
-            route_points = []
-
-            for step_idx, node_idx in enumerate(route[:-1]):
-                if node_idx == 0:
-                    continue
+            # 绘制中间各个送货站点
+            for step_idx, node_idx in enumerate(route[1:-1], start=1):
                 lng, lat = coords[node_idx]
-                route_points.append([lat, lng])
-
                 folium.Marker(
                     [lat, lng],
                     popup=f"司机 {vehicle_id + 1} - 站 {step_idx}: {valid_locations[node_idx]}",
-                    tooltip=f"🚚 司机 {vehicle_id + 1} | 站 {step_idx}: {valid_locations[node_idx]}",
+                    tooltip=f"🚚 司机 {vehicle_id + 1} | 站 {step_idx}",
                     icon=folium.Icon(color=color, icon="info-sign"),
                 ).add_to(m)
 
-            # 画线 (连接起点与各个目的地)
+            # 绘制连线 (会自动连接回起点仓库，形成闭环)
             path_coords = [[coords[node][1], coords[node][0]] for node in route]
             folium.PolyLine(
-                path_coords, color=color, weight=4, opacity=0.8
+                path_coords, color=color, weight=5, opacity=0.85
             ).add_to(m)
 
-        st_folium(m, width=700, height=420, key="multi_delivery_map")
+        st_folium(m, width="100%", height=500, key="v25_roundtrip_map")
 
-        # 显示每个司机的派单与一键导航
-        st.markdown("### 📱 各司机派单列表与一键导航")
+    with col_list:
+        st.subheader("📱 司机派单与导航中心")
 
         for driver_idx, (vehicle_id, route) in enumerate(routes.items()):
-            # 计算该司机的耗时
+            color = colors[driver_idx % len(colors)]
             v_time_sec = sum(
                 time_matrix[route[i]][route[i + 1]] + service_times_sec[route[i + 1]]
                 for i in range(len(route) - 1)
             )
 
-            with st.expander(
-                f"🚚 司机 {vehicle_id + 1} 派单路线（共 {len(route)-2} 个送到点，预计耗时: {round(v_time_sec/60, 1)} 分钟）",
-                expanded=True,
-            ):
-                for step_idx, node_idx in enumerate(route[1:-1], start=1):
-                    loc_name = valid_locations[node_idx]
-                    lng, lat = coords[node_idx]
-                    gmaps_url, waze_url = build_nav_urls(loc_name, lat, lng)
+            st.markdown(
+                f"#### 🚚 **司机 {vehicle_id + 1}**  └─ 全程预计耗时: `{round(v_time_sec/60, 1)} 分钟` (含返程)"
+            )
 
-                    col_info, col_btn1, col_btn2 = st.columns([3, 1, 1])
-                    with col_info:
-                        st.markdown(f"**第 {step_idx} 站**: {loc_name}")
-                    with col_btn1:
+            # 派单站点明细
+            for step_idx, node_idx in enumerate(route[1:-1], start=1):
+                loc_name = valid_locations[node_idx]
+                lng, lat = coords[node_idx]
+                gmaps_url, waze_url = build_nav_urls(loc_name, lat, lng)
+
+                with st.container():
+                    st.markdown(f"**站 {step_idx}**: {loc_name}")
+                    btn_c1, btn_c2 = st.columns(2)
+                    with btn_c1:
                         st.link_button(
                             "🗺️ Google Maps",
                             gmaps_url,
                             use_container_width=True,
                         )
-                    with col_btn2:
+                    with btn_c2:
                         st.link_button(
                             "🚙 Waze 导航", waze_url, use_container_width=True
                         )
+                    st.divider()
+
+            # 最后一站：显示返回仓库导航
+            depot_name = valid_locations[0]
+            depot_lng, depot_lat = coords[0]
+            gmaps_depot, waze_depot = build_nav_urls(f"返程: {depot_name}", depot_lat, depot_lng)
+            
+            with st.container():
+                st.markdown(f"**🏁 终点站 (返回仓库)**: {depot_name}")
+                btn_d1, btn_d2 = st.columns(2)
+                with btn_d1:
+                    st.link_button("🗺️ 返程 Google Maps", gmaps_depot, use_container_width=True)
+                with btn_d2:
+                    st.link_button("🚙 返程 Waze 导航", waze_depot, use_container_width=True)
+                st.divider()
+else:
+    st.info("👈 请在左侧侧边栏输入配送地点与司机人数，点击【一键生成最佳调度方案】！")
